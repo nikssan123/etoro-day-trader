@@ -80,6 +80,12 @@ EXIT_CODE=$?
 
 DURATION=$(( $(date +%s) - START_EPOCH ))
 
+# Re-snapshot AFTER the agent runs. The pre-run snapshot above predates anything this
+# cycle traded, so without this portfolio.json and positions.json still describe an
+# account with no positions — the dashboard reads those files and shows an empty page
+# until some later cycle happens to refresh them. Also makes run-end's equity current.
+./bin/etoro snapshot >> "$LOG" 2>&1
+
 # Count what this run actually did, from the append-only logs rather than trusting
 # the agent's own account of itself.
 # grep -c prints 0 and exits 1 when nothing matches, so take the output and default it
