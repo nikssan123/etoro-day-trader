@@ -44,4 +44,9 @@ RUN chmod +x /usr/local/bin/entrypoint.sh
 USER node
 
 ENTRYPOINT ["/usr/local/bin/entrypoint.sh"]
-CMD ["supercronic", "/etc/bot-crontab"]
+# Absolute path, not a bare `supercronic`. As PID 1 supercronic re-execs itself so the
+# parent can reap zombies, and it does that with a raw ForkExec(os.Args[0]) — execve,
+# which does no PATH lookup. With a bare name argv[0] is unresolvable and the container
+# dies instantly with "Failed to fork exec: no such file or directory", crash-looping
+# before a single cycle runs.
+CMD ["/usr/local/bin/supercronic", "/etc/bot-crontab"]
