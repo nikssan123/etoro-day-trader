@@ -35,6 +35,8 @@ prompts/               one per cycle
 strategy/rules.md      learned rules — written by the bot, loaded every run
 strategy/hypotheses.md patterns not yet supported by sample size
 data/                  append-only logs + derived snapshots (the dashboard contract)
+dashboard/             read-only web dashboard (TypeScript, Express + React)
+docker/                bot container image and its schedule
 ```
 
 ## Getting started
@@ -88,6 +90,24 @@ billing to an interactive login.
 
 Verified on the image: correct timezone, valid crontab, and egress to `public-api.etoro.com`,
 `mcp.public-api.etoro.com` and `api.anthropic.com` under the hardened settings.
+
+## Dashboard
+
+A password-protected, **read-only** web view at your own domain, served over a Cloudflare
+Tunnel so the VPS opens no inbound port. Setup — including the Cloudflare steps — is in
+[`dashboard/README.md`](dashboard/README.md).
+
+```bash
+cp .env.dashboard.example .env.dashboard
+docker compose run --rm --no-deps --entrypoint node dashboard \
+  server/dist/hash-password.js 'your dashboard password'   # paste into .env.dashboard
+openssl rand -hex 32                                        # JWT_SECRET
+# add TUNNEL_TOKEN to .env, then:
+docker compose up -d
+```
+
+It runs as its own container with no eToro credentials, no Claude Code, and `data/` mounted
+read-only — there is no endpoint that can trade, so exposing it cannot cost money.
 
 ## Schedule (Europe/Sofia; US session is 16:30–23:00 local)
 

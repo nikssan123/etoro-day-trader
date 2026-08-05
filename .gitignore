@@ -4,7 +4,14 @@ logs/
 __pycache__/
 *.pyc
 .env
+.env.dashboard
 !.env.example
+!.env.dashboard.example
 
 .cycle.pid
 .cycle.lock
+
+# Dashboard build artifacts
+node_modules/
+dashboard/*/dist/
+*.tsbuildinfo

@@ -45,5 +45,71 @@ services:
         max-size: "10m"
         max-file: "5"
 
+  # Read-only web view of what the bot is doing. Deliberately a separate image and a
+  # separate container from the bot: this one is reachable from the internet, so it
+  # gets no Claude Code, no shell tooling, and no eToro credentials — only the data
+  # files, mounted read-only.
+  dashboard:
+    build:
+      context: ./dashboard
+      dockerfile: Dockerfile
+    image: etoro-trading-dashboard:latest
+    container_name: trading-dashboard
+    restart: unless-stopped
+
+    environment:
+      TZ: ${TZ:-Europe/Sofia}
+      NODE_ENV: production
+
+    # Secrets come from a SEPARATE file, for two reasons:
+    #  1. compose does not interpolate env_file values, and a bcrypt hash is full of
+    #     `$` — via `environment:` it would be silently mangled into a broken hash.
+    #  2. it keeps ETORO_USER_KEY (in .env) out of the internet-facing container.
+    env_file:
+      - .env.dashboard
+
+    volumes:
+      - ./data:/data:ro
+      - ./strategy:/strategy:ro
+
+    # No published port: the tunnel reaches it over the internal network, so the VPS
+    # never opens a port to the internet for this. Uncomment only for local debugging.
+    # ports:
+    #   - "127.0.0.1:8080:8080"
+
+    mem_limit: 512m
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  # Cloudflare Tunnel: outbound-only connection to Cloudflare's edge, so the dashboard
+  # is reachable at your domain with no inbound firewall rule, no port forwarding and
+  # no public IP exposure. TLS terminates at Cloudflare.
+  cloudflared:
+    image: cloudflare/cloudflared:latest
+    container_name: trading-tunnel
+    restart: unless-stopped
+    command: tunnel --no-autoupdate run
+    environment:
+      TUNNEL_TOKEN: ${TUNNEL_TOKEN:?set TUNNEL_TOKEN in .env - create a tunnel in Cloudflare Zero Trust and copy its token}
+    depends_on:
+      - dashboard
+    mem_limit: 256m
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
 volumes:
   claude-home:

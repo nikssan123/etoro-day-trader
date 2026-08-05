@@ -32,7 +32,9 @@ BASE = "https://public-api.etoro.com"
 # Application key: an identifier, not a secret (documented as such in the eToro skill).
 APP_KEY = "sdgdskldFPLGfjHn1421dgnlxdGTbngdflg6290bRjslfihsjhSDsdgGHH25hjf"
 REPO = Path(__file__).resolve().parent.parent
-DATA = REPO / "data"
+# Overridable so the dashboard's fixtures (and any test run) can point at a throwaway
+# directory instead of the live trade log.
+DATA = Path(os.environ.get("ETORO_DATA_DIR") or (REPO / "data"))
 
 # The eToro screener requires a `fields` projection. These are the ones that survive
 # the API's field validation (some documented fields 404 the request when projected).
