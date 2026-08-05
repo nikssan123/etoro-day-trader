@@ -54,8 +54,9 @@ export function issueSession(res: Response): void {
   res.cookie(COOKIE, token, {
     httpOnly: true,
     sameSite: 'strict',
-    // Cloudflare terminates TLS and forwards over the tunnel; the browser still only
-    // ever talks HTTPS, so the cookie must be Secure in production.
+    // The reverse proxy terminates TLS and forwards plain HTTP over the internal Docker
+    // network; the browser still only ever talks HTTPS, so the cookie must be Secure in
+    // production.
     secure: process.env.NODE_ENV === 'production',
     maxAge: SESSION_DAYS * 24 * 60 * 60 * 1000,
     path: '/',

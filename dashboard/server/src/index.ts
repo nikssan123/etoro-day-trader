@@ -22,8 +22,9 @@ const app = express();
 const PORT = Number(process.env.PORT ?? 8080);
 const WEB_DIR = process.env.WEB_DIR ?? path.join(__dirname, '../../web/dist');
 
-// Behind Cloudflare, the client IP arrives in a forwarded header. Trust exactly one
-// proxy hop so the rate limiter keys on the real client rather than the tunnel.
+// Behind the reverse proxy, the client IP arrives in a forwarded header. Trust exactly
+// one hop so the rate limiter keys on the real client rather than the proxy. Chaining a
+// second proxy in front without raising this would key every login attempt on one IP.
 app.set('trust proxy', 1);
 
 app.use(helmet({

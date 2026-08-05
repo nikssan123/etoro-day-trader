@@ -1,3 +1,14 @@
+# The dashboard is fronted by the shared Caddy already running on this host (the one
+# that serves the other project). Caddy joins the external `web` network and routes to
+# containers on it by hostname, so the dashboard needs no published port and no tunnel.
+#
+# Create the network once per host, before the first `up`:
+#   docker network create web
+networks:
+  web:
+    external: true
+    name: web
+
 services:
   bot:
     build:
@@ -31,6 +42,11 @@ services:
     memswap_limit: 2g
     cpus: 1.5
 
+    # Deliberately NOT on the `web` network — it stays on the compose default bridge.
+    # `web` is shared with the other project on this host, whose internal API is
+    # unauthenticated precisely because it is only reachable from that network. This
+    # container is an autonomous agent with shell access; it must not be able to dial it.
+    #
     # Defence in depth: the bot is an autonomous agent with shell access processing
     # untrusted input (market data, web results). It gets no extra kernel capabilities
     # and cannot escalate privileges.
@@ -62,8 +78,8 @@ services:
       NODE_ENV: production
 
     # Secrets come from a SEPARATE file, for two reasons:
-    #  1. compose does not interpolate env_file values, and a bcrypt hash is full of
-    #     `$` — via `environment:` it would be silently mangled into a broken hash.
+    #  1. compose does not interpolate env_file values, so a hash containing `$` cannot
+    #     be silently mangled the way it would be via `environment:`.
     #  2. it keeps ETORO_USER_KEY (in .env) out of the internet-facing container.
     env_file:
       - .env.dashboard
@@ -72,35 +88,21 @@ services:
       - ./data:/data:ro
       - ./strategy:/strategy:ro
 
-    # No published port: the tunnel reaches it over the internal network, so the VPS
-    # never opens a port to the internet for this. Uncomment only for local debugging.
+    # Joins the shared edge network under an explicit alias. Caddy reverse-proxies to
+    # `trading-dashboard:8080`. The alias is spelled out rather than relying on the
+    # compose service name because `dashboard` is far too generic for a network shared
+    # with another project.
+    networks:
+      web:
+        aliases:
+          - trading-dashboard
+
+    # No published port: Caddy reaches it over the `web` network, so the VPS never opens
+    # a port to the internet for this. Uncomment only for local debugging.
     # ports:
     #   - "127.0.0.1:8080:8080"
 
     mem_limit: 512m
-    security_opt:
-      - no-new-privileges:true
-    cap_drop:
-      - ALL
-    logging:
-      driver: json-file
-      options:
-        max-size: "10m"
-        max-file: "3"
-
-  # Cloudflare Tunnel: outbound-only connection to Cloudflare's edge, so the dashboard
-  # is reachable at your domain with no inbound firewall rule, no port forwarding and
-  # no public IP exposure. TLS terminates at Cloudflare.
-  cloudflared:
-    image: cloudflare/cloudflared:latest
-    container_name: trading-tunnel
-    restart: unless-stopped
-    command: tunnel --no-autoupdate run
-    environment:
-      TUNNEL_TOKEN: ${TUNNEL_TOKEN:?set TUNNEL_TOKEN in .env - create a tunnel in Cloudflare Zero Trust and copy its token}
-    depends_on:
-      - dashboard
-    mem_limit: 256m
     security_opt:
       - no-new-privileges:true
     cap_drop:

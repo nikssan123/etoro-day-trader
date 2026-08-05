@@ -21,8 +21,8 @@ Everything else is defence in depth:
 - **Rate limited login** — 10 attempts per 15 minutes per IP
 - **helmet** with a strict CSP; no external origins are permitted
 - `cap_drop: ALL`, `no-new-privileges`, non-root user, 512 MB cap
-- **No published port.** Cloudflare reaches it over the tunnel's internal network, so the
-  VPS opens nothing to the internet.
+- **No published port.** The reverse proxy reaches it over an internal Docker network, so
+  this container opens nothing on the host itself.
 
 ## Setup
 
@@ -47,30 +47,33 @@ Put both in `.env.dashboard`.
 > used now contains no `$` at all, so that class of bug is gone. The split also keeps
 > `ETORO_USER_KEY` out of the internet-facing container entirely.
 
-### 2. Cloudflare Tunnel
+### 2. Domain
 
-The tunnel dials **out** to Cloudflare, so your VPS never opens an inbound port and never
-exposes its IP.
+The container publishes no port. It joins the external `web` Docker network under the
+alias **`trading-dashboard`**, and the reverse proxy that already owns `:80/:443` on the
+host routes your domain to `trading-dashboard:8080`. TLS terminates on your own box.
 
-1. Add your domain to Cloudflare (point the registrar at Cloudflare's nameservers).
-2. **Zero Trust** → **Networks** → **Tunnels** → **Create a tunnel** → **Cloudflared**.
-3. Name it (e.g. `trading-bot`) and copy the **token** from the install command.
-4. Put it in `.env` as `TUNNEL_TOKEN=…`.
-5. Still in the tunnel config, add a **Public Hostname**:
-   - Subdomain `bot`, domain `yourdomain.com`
-   - Service **Type** `HTTP`, **URL** `dashboard:8080`
-     (`dashboard` is the compose service name — the containers share a network, so no IP
-     or port mapping is needed)
-6. `docker compose up -d`
+1. Create the shared network once per host, if it does not exist:
+   `docker network create web`
+2. Point an **A record** for the hostname (e.g. `bot.yourdomain.com`) at the VPS IP. If
+   the zone is on Cloudflare, keep it **DNS-only** (grey cloud) so the proxy can complete
+   its own ACME challenge and see real client IPs.
+3. Add a site block to the host's Caddyfile:
+   ```caddy
+   bot.yourdomain.com {
+       encode zstd gzip
+       reverse_proxy trading-dashboard:8080
+   }
+   ```
+   An explicit block matters if that Caddy also serves wildcard or on-demand-TLS sites —
+   otherwise the hostname falls through to a catch-all that will refuse it a certificate.
+4. Reload the proxy, then `docker compose up -d`.
 
-Your dashboard is then at `https://bot.yourdomain.com` with a Cloudflare certificate.
+The dashboard is then at `https://bot.yourdomain.com`. The certificate is issued
+automatically on the first request; no wildcard and no DNS-01 credentials are involved.
 
-### 3. Optional: Cloudflare Access in front
-
-For a second, independent lock, add **Zero Trust → Access → Applications** over the same
-hostname with a one-time-PIN policy limited to your email. Requests are then authenticated
-at Cloudflare's edge before they ever reach your VPS, and the app's own password still
-applies behind it. Free for personal use.
+The app sets `trust proxy` to exactly one hop, so the login rate limiter keys on the real
+client IP behind that proxy — do not chain a second one in front without adjusting it.
 
 ## Local development
 

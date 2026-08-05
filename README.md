@@ -93,16 +93,16 @@ Verified on the image: correct timezone, valid crontab, and egress to `public-ap
 
 ## Dashboard
 
-A password-protected, **read-only** web view at your own domain, served over a Cloudflare
-Tunnel so the VPS opens no inbound port. Setup — including the Cloudflare steps — is in
-[`dashboard/README.md`](dashboard/README.md).
+A password-protected, **read-only** web view at your own domain. It publishes no host
+port: it joins the external `web` Docker network under the alias `trading-dashboard`, and
+the reverse proxy already running on the host routes the domain to it. Setup — including
+the proxy and DNS steps — is in [`dashboard/README.md`](dashboard/README.md).
 
 ```bash
 cp .env.dashboard.example .env.dashboard
 docker compose run --rm --no-deps --entrypoint node dashboard \
   server/dist/hash-password.js 'your dashboard password'   # paste into .env.dashboard
 openssl rand -hex 32                                        # JWT_SECRET
-# add TUNNEL_TOKEN to .env, then:
 docker compose up -d
 ```
 
