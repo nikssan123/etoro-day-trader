@@ -1,0 +1,17 @@
+{
+  "permissions": {
+    "allow": [
+      "mcp__etoro-public-api__execute-read",
+      "mcp__etoro-public-api__execute-write",
+      "mcp__etoro-public-api__get-all-routes",
+      "mcp__etoro-public-api__get-route-spec",
+      "Bash(./bin/etoro:*)",
+      "Bash(bin/etoro:*)",
+      "Read",
+      "Write",
+      "Edit",
+      "WebSearch",
+      "WebFetch"
+    ]
+  }
+}

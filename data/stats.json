@@ -1,0 +1,23 @@
+{
+  "generated_at": "2026-08-05T12:50:57Z",
+  "overall": {
+    "n": 0,
+    "tier": "hypothesis"
+  },
+  "by_setup": {},
+  "by_signal": {},
+  "by_asset_class": {},
+  "by_conviction": {},
+  "rolling20_expectancy_r": [],
+  "error_categories": {},
+  "error_categories_by_month": {},
+  "stop_and_exit_quality": {
+    "avg_mae_r_of_winners": null,
+    "avg_mfe_r_of_losers": null
+  },
+  "tier_thresholds": {
+    "hypothesis": "n<10 \u2014 changes nothing",
+    "provisional": "n>=10 \u2014 may adjust ranking/sizing, may not veto",
+    "established": "n>=30 \u2014 may veto a setup"
+  }
+}

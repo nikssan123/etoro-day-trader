@@ -1,0 +1,135 @@
+{
+  "version": 1,
+  "description": "Data contract for the eToro demo trading bot. Append-only JSONL is the source of truth; the *.json files are derived snapshots, safe to regenerate. All timestamps are ISO-8601 UTC with a trailing Z. All monetary values are USD. All trade outcomes are additionally expressed in R multiples (1R = the dollar amount risked if the stop is hit), which makes trades of different sizes comparable.",
+  "account": {
+    "mode": "demo",
+    "demoCid": 21261700,
+    "note": "The API credentials lack the trade.real:write scope, so real-money trading is structurally impossible."
+  },
+  "files": {
+    "events.jsonl": {
+      "kind": "append-only",
+      "description": "Every decision and action taken by any cycle. The audit log.",
+      "fields": {
+        "ts": "ISO-8601 UTC",
+        "run_id": "string, links to runs.jsonl",
+        "cycle": "overnight|premarket|open|midday|close|weekly|monthly",
+        "type": "entry|exit|exit_partial|stop_move|skip|circuit_breaker|rule_applied|rule_created|rule_promoted|rule_demoted|error|note",
+        "symbol": "string, may be null",
+        "instrument_id": "int, may be null",
+        "detail": "object, type-specific payload",
+        "reason": "free text"
+      }
+    },
+    "trades.jsonl": {
+      "kind": "append-only",
+      "description": "The learning corpus. One record per position, written at entry with the thesis tags and completed at exit with the outcome and postmortem. Records are matched on position_id; the LAST record for a position_id wins.",
+      "fields": {
+        "position_id": "int, eToro position id — the stable key",
+        "order_id": "int, eToro order id",
+        "run_id": "string",
+        "symbol": "string",
+        "instrument_id": "int",
+        "asset_class": "stock|crypto|etf|other",
+        "direction": "long|short",
+        "status": "open|closed",
+        "opened_at": "ISO-8601 UTC",
+        "closed_at": "ISO-8601 UTC, null while open",
+        "setup": "breakout|pullback|momentum|mean_reversion|catalyst",
+        "signals": "array of snake_case tags, e.g. [above_sma50, rsi_62, volume_2x]",
+        "thesis": "falsifiable statement of why this should work",
+        "invalidation": "what would prove the thesis wrong",
+        "conviction": "int 1-5",
+        "expected_hold_days": "number",
+        "expected_move_pct": "number",
+        "entry_rate": "number",
+        "stop": "number",
+        "target": "number",
+        "amount": "number, USD margin committed",
+        "leverage": "int",
+        "risk_r": "number, USD at risk if the stop hits = 1R",
+        "rules_applied": "array of rule ids from strategy/rules.md",
+        "exit_rate": "number, null while open",
+        "outcome_r": "number, realized PnL in R multiples",
+        "outcome_usd": "number",
+        "exit_reason": "stop_hit|target_hit|thesis_invalidated|time_stop|risk_management|manual",
+        "hold_days": "number",
+        "mae_r": "number, maximum adverse excursion in R (worst unrealized point)",
+        "mfe_r": "number, maximum favorable excursion in R (best unrealized point)",
+        "thesis_correct": "boolean",
+        "error_category": "thesis_wrong|late_entry|stop_too_tight|sizing|exit_too_early|market_regime|execution|none",
+        "lesson": "one or two sentences, specific and actionable"
+      }
+    },
+    "excursions.jsonl": {
+      "kind": "append-only",
+      "description": "Mark-to-market sample of every open position, appended once per cycle by `etoro mark`. Feeds MAE/MFE, which is what distinguishes 'the thesis was wrong' from 'the stop was too tight'.",
+      "fields": {
+        "ts": "ISO-8601 UTC",
+        "position_id": "int",
+        "symbol": "string",
+        "rate": "number, current price",
+        "pnl_usd": "number, unrealized",
+        "pnl_pct": "number, unrealized percent of margin",
+        "pnl_r": "number, unrealized in R multiples"
+      }
+    },
+    "runs.jsonl": {
+      "kind": "append-only",
+      "description": "One record per cycle execution.",
+      "fields": {
+        "run_id": "string",
+        "cycle": "string",
+        "started_at": "ISO-8601 UTC",
+        "ended_at": "ISO-8601 UTC",
+        "duration_s": "number",
+        "equity": "number",
+        "cash": "number",
+        "open_positions": "int",
+        "trades_opened": "int",
+        "trades_closed": "int",
+        "no_trade_reason": "string or null — MUST name a specific guardrail when the cycle opened nothing",
+        "exit_code": "int"
+      }
+    },
+    "equity.jsonl": {
+      "kind": "append-only",
+      "description": "Equity curve points for charting, one per cycle.",
+      "fields": {
+        "ts": "ISO-8601 UTC",
+        "equity": "number",
+        "cash": "number",
+        "unrealized_pnl": "number",
+        "open_positions": "int"
+      }
+    },
+    "benchmark.jsonl": {
+      "kind": "append-only",
+      "description": "Reference asset prices sampled alongside the equity curve, so improvement can be separated from market drift.",
+      "fields": {
+        "ts": "ISO-8601 UTC",
+        "prices": "object mapping symbol to price, e.g. {SPX500: 6100.2, NSDQ100: 22000.0, BTC: 95000.0}"
+      }
+    },
+    "stats.json": {
+      "kind": "derived",
+      "description": "Computed by `etoro stats` in deterministic Python. Never hand-written, never estimated by the model. Aggregates trades.jsonl by setup, signal tag, asset class and conviction level; includes rolling 20-trade expectancy, the primary improvement metric."
+    },
+    "portfolio.json": {
+      "kind": "derived",
+      "description": "Latest account snapshot: equity, cash, open positions with live PnL."
+    },
+    "positions.json": {
+      "kind": "derived",
+      "description": "Open positions joined with their thesis fields from trades.jsonl. This is what gives a cold run memory of why each position exists."
+    },
+    "watchlist.json": {
+      "kind": "state",
+      "description": "Ranked candidates carried between cycles, so research done in premarket feeds entries at open.",
+      "fields": {
+        "updated_at": "ISO-8601 UTC",
+        "candidates": "array of {symbol, instrument_id, asset_class, score, setup, signals, thesis, stop, target, notes}"
+      }
+    }
+  }
+}

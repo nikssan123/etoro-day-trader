@@ -1,0 +1,21 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>Label</key><string>com.nixon.tradingbot.weekly</string>
+	<key>ProgramArguments</key>
+	<array>
+		<string>/Users/nixon/Code/Stock trading bot/bin/trade-cycle.sh</string>
+		<string>weekly</string>
+	</array>
+	<key>WorkingDirectory</key><string>/Users/nixon/Code/Stock trading bot</string>
+	<key>StartCalendarInterval</key>
+	<array>
+		<dict><key>Weekday</key><integer>6</integer><key>Hour</key><integer>12</integer><key>Minute</key><integer>15</integer></dict>
+	</array>
+	<key>StandardOutPath</key><string>/Users/nixon/Code/Stock trading bot/logs/launchd-weekly.out</string>
+	<key>StandardErrorPath</key><string>/Users/nixon/Code/Stock trading bot/logs/launchd-weekly.err</string>
+	<key>RunAtLoad</key><false/>
+	<key>ProcessType</key><string>Background</string>
+</dict>
+</plist>

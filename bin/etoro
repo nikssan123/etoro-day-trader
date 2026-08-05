@@ -1,0 +1,836 @@
+#!/usr/bin/env python3
+"""Compact read/analysis helper for the eToro demo trading bot.
+
+Exists for one reason above all: the raw eToro market-data endpoints will happily
+return 300k+ characters (a `/market-data/search` call without a `fields` param
+returns every field of every instrument). Dropping that into an agent run destroys
+it. Every command here returns a small, shaped JSON payload instead, and does the
+number-crunching locally so it never costs tokens.
+
+Orders are NOT placed here — they go through the eToro MCP `execute-write` tool,
+which supplies the x-request-id idempotency GUID and keeps the audited write path.
+
+Credentials: ETORO_USER_KEY env var, else the x-user-key already configured on the
+eToro MCP server entry in ~/.claude.json. The key is never written to this repo.
+"""
+
+import argparse
+import json
+import os
+import statistics
+import sys
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+import uuid
+from collections import defaultdict
+from datetime import datetime, timezone, timedelta
+from pathlib import Path
+
+BASE = "https://public-api.etoro.com"
+# Application key: an identifier, not a secret (documented as such in the eToro skill).
+APP_KEY = "sdgdskldFPLGfjHn1421dgnlxdGTbngdflg6290bRjslfihsjhSDsdgGHH25hjf"
+REPO = Path(__file__).resolve().parent.parent
+DATA = REPO / "data"
+
+# The eToro screener requires a `fields` projection. These are the ones that survive
+# the API's field validation (some documented fields 404 the request when projected).
+SCREEN_FIELDS = [
+    "instrumentId", "displayname", "internalSymbolFull", "currentRate",
+    "dailyPriceChange", "weeklyPriceChange", "monthlyPriceChange",
+    "isCurrentlyTradable", "popularityUniques7Day",
+]
+
+BENCHMARK_SYMBOLS = ["SPX500", "NSDQ100", "BTC"]
+
+# Sanity caps that reject corrupt catalog rows (real observed value: a monthlyPriceChange
+# of 2,649,900). Anything beyond these is bad data, not a tradable move.
+UNIVERSE_RULES = {
+    "max_abs_monthly_pct": 150.0,
+    "max_abs_daily_pct": 40.0,
+}
+UNIVERSE_TTL_HOURS = 12
+
+
+# --------------------------------------------------------------------------- auth
+
+def user_key():
+    key = os.environ.get("ETORO_USER_KEY")
+    if key:
+        return key.strip()
+    cfg = Path.home() / ".claude.json"
+    try:
+        with cfg.open() as fh:
+            servers = json.load(fh).get("mcpServers", {})
+        key = servers.get("etoro-public-api", {}).get("headers", {}).get("x-user-key")
+    except (OSError, ValueError, KeyError):
+        key = None
+    if not key:
+        die("no eToro credentials: set ETORO_USER_KEY, or configure x-user-key on the "
+            "etoro-public-api MCP server entry in ~/.claude.json")
+    return key
+
+
+def die(msg, code=1):
+    print(json.dumps({"error": msg}), file=sys.stderr)
+    sys.exit(code)
+
+
+# ---------------------------------------------------------------------- http layer
+
+def api_get(path, params=None, retries=2):
+    """GET a relative eToro path. Returns parsed JSON, or dies with a shaped error."""
+    url = BASE + path
+    if params:
+        clean = {k: v for k, v in params.items() if v is not None}
+        url += "?" + urllib.parse.urlencode(clean)
+    headers = {
+        "x-user-key": user_key(),
+        "x-api-key": APP_KEY,
+        "x-request-id": str(uuid.uuid4()),
+        "Accept": "application/json",
+        # Cloudflare in front of the API rejects urllib's default UA with error 1010.
+        "User-Agent": "etoro-trading-bot/1.0",
+    }
+    for attempt in range(retries + 1):
+        req = urllib.request.Request(url, headers=headers)
+        try:
+            with urllib.request.urlopen(req, timeout=30) as resp:
+                return json.loads(resp.read().decode("utf-8") or "null")
+        except urllib.error.HTTPError as exc:
+            if exc.code == 429 and attempt < retries:
+                time.sleep(int(exc.headers.get("Retry-After", 5)))
+                continue
+            body = exc.read().decode("utf-8", "replace")[:300]
+            hint = ""
+            if exc.code == 404 and "/market-data/search" in path:
+                hint = (" — a 404 here usually means an invalid `fields` entry, an unindexed "
+                        "filter, or a bad sort (descending sort is `-field`, not `field desc`)")
+            die(f"HTTP {exc.code} on {path}{hint}: {body}", 2)
+        except (urllib.error.URLError, TimeoutError) as exc:
+            if attempt < retries:
+                time.sleep(2)
+                continue
+            die(f"network error on {path}: {exc}", 2)
+
+
+# --------------------------------------------------------------------------- utils
+
+def now_iso():
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def emit(obj):
+    print(json.dumps(obj, indent=2, default=str))
+
+
+def append_jsonl(name, record):
+    DATA.mkdir(exist_ok=True)
+    with (DATA / name).open("a") as fh:
+        fh.write(json.dumps(record, default=str) + "\n")
+
+
+def read_jsonl(name):
+    path = DATA / name
+    if not path.exists():
+        return []
+    out = []
+    with path.open() as fh:
+        for line in fh:
+            line = line.strip()
+            if line:
+                try:
+                    out.append(json.loads(line))
+                except ValueError:
+                    continue
+    return out
+
+
+def write_json(name, obj):
+    DATA.mkdir(exist_ok=True)
+    (DATA / name).write_text(json.dumps(obj, indent=2, default=str) + "\n")
+
+
+def clean_items(payload):
+    """Strip the sentinel row the screener always prepends (instrumentId -100000)."""
+    items = (payload or {}).get("items", []) or []
+    return [i for i in items if i.get("instrumentId", 0) > 0 and i.get("displayname")]
+
+
+def latest_trades():
+    """trades.jsonl is append-only; the last record per position_id is authoritative."""
+    merged = {}
+    for rec in read_jsonl("trades.jsonl"):
+        pid = rec.get("position_id")
+        if pid is None:
+            continue
+        merged.setdefault(pid, {}).update(rec)
+    return merged
+
+
+# ------------------------------------------------------------------ market data
+
+def cmd_types(args):
+    emit(api_get("/api/v1/market-data/instrument-types"))
+
+
+def read_universe_config():
+    """Parse config/universe.txt into [(symbol, asset_class)]."""
+    path = REPO / "config" / "universe.txt"
+    if not path.exists():
+        die(f"missing universe config at {path}")
+    out, asset_class = [], "stock"
+    for line in path.read_text().splitlines():
+        line = line.split("#", 1)[0].strip()
+        if not line:
+            continue
+        if line.startswith("[") and line.endswith("]"):
+            asset_class = line[1:-1].strip().lower().rstrip("s")
+            asset_class = {"stock": "stock", "crypto": "crypto", "etf": "etf"}.get(
+                asset_class, asset_class)
+            continue
+        for symbol in line.split():
+            out.append((symbol.upper(), asset_class))
+    return out
+
+
+def lookup(symbol):
+    """Exact-symbol lookup — the only reliable discovery path on this API."""
+    payload = api_get("/api/v1/market-data/search", {
+        "fields": ",".join(SCREEN_FIELDS), "internalSymbolFull": symbol, "pageSize": 60})
+    for item in clean_items(payload):
+        if (item.get("internalSymbolFull") or "").upper() == symbol.upper():
+            return item
+    return None
+
+
+def sane(item):
+    """Reject corrupt rows — the catalog carries monthlyPriceChange values in the millions."""
+    for field, cap in (("monthlyPriceChange", "max_abs_monthly_pct"),
+                       ("dailyPriceChange", "max_abs_daily_pct")):
+        val = item.get(field)
+        if val is not None and abs(val) > UNIVERSE_RULES[cap]:
+            return False
+    return True
+
+
+def build_universe(verbose=False):
+    """Resolve every configured symbol and cache it. One call per symbol, paced under
+    the 120-req/60s market-data budget. Runs once per TTL, so only premarket pays it."""
+    instruments, missing = [], []
+    for symbol, asset_class in read_universe_config():
+        item = lookup(symbol)
+        if not item:
+            missing.append(symbol)
+        elif not sane(item):
+            missing.append(f"{symbol}(bad-data)")
+        else:
+            instruments.append({
+                "symbol": symbol,
+                "name": item.get("displayname"),
+                "instrument_id": item.get("instrumentId"),
+                "asset_class": asset_class,
+                "price": item.get("currentRate"),
+                "daily_pct": item.get("dailyPriceChange"),
+                "weekly_pct": item.get("weeklyPriceChange"),
+                "monthly_pct": item.get("monthlyPriceChange"),
+                "tradable": item.get("isCurrentlyTradable"),
+            })
+        if verbose:
+            print(f"  {symbol:8} {'ok' if item else 'MISSING'}", file=sys.stderr)
+        time.sleep(0.55)  # stay under 120 requests / 60 seconds
+    data = {"built_at": now_iso(), "count": len(instruments),
+            "missing": missing, "instruments": instruments}
+    write_json("universe.json", data)
+    return data
+
+
+def load_universe(max_age_hours=UNIVERSE_TTL_HOURS, force=False):
+    path = DATA / "universe.json"
+    if not force and path.exists():
+        try:
+            data = json.loads(path.read_text())
+            built = datetime.strptime(data["built_at"], "%Y-%m-%dT%H:%M:%SZ").replace(
+                tzinfo=timezone.utc)
+            if datetime.now(timezone.utc) - built < timedelta(hours=max_age_hours):
+                return data
+        except (ValueError, KeyError, OSError):
+            pass
+    return build_universe()
+
+
+def cmd_universe(args):
+    data = build_universe(verbose=args.verbose) if args.refresh else load_universe()
+    classes = defaultdict(int)
+    for row in data["instruments"]:
+        classes[row["asset_class"]] += 1
+    emit({"built_at": data["built_at"], "count": data["count"], "by_class": dict(classes),
+          "missing": data.get("missing", []),
+          "tradable_now": sum(1 for r in data["instruments"] if r.get("tradable"))})
+
+
+SORT_KEYS = {"daily": "daily_pct", "weekly": "weekly_pct", "monthly": "monthly_pct",
+             "price": "price"}
+
+
+def cmd_screen(args):
+    """Rank the cached universe locally. Ranking never touches the API, so it is fast,
+    reproducible, and immune to the screener's unindexed-filter and corrupt-data traps."""
+    data = build_universe() if args.refresh else load_universe()
+    rows = data["instruments"]
+    if args.asset_class != "all":
+        rows = [r for r in rows if r["asset_class"] == args.asset_class]
+    if args.tradable_only:
+        rows = [r for r in rows if r.get("tradable")]
+    if args.min_price is not None:
+        rows = [r for r in rows if (r.get("price") or 0) >= args.min_price]
+    if args.symbols:
+        wanted = {s.upper() for s in args.symbols.split(",")}
+        rows = [r for r in rows if r["symbol"].upper() in wanted]
+
+    key = SORT_KEYS.get(args.sort, args.sort)
+    rows = sorted(rows, key=lambda r: (r.get(key) is None, -(r.get(key) or 0) if not args.asc
+                                       else (r.get(key) or 0)))
+    emit({"universe_built_at": data["built_at"], "sorted_by": args.sort,
+          "count": len(rows[:args.limit]), "items": rows[:args.limit]})
+
+
+def resolve(symbol):
+    """Symbol -> instrument record. Uses the cached universe when possible, since the
+    cache already holds the resolved instrument id."""
+    path = DATA / "universe.json"
+    if path.exists():
+        try:
+            for row in json.loads(path.read_text()).get("instruments", []):
+                if row["symbol"].upper() == symbol.upper():
+                    return {"instrumentId": row["instrument_id"],
+                            "internalSymbolFull": row["symbol"],
+                            "displayname": row.get("name"),
+                            "currentRate": row.get("price"),
+                            "dailyPriceChange": row.get("daily_pct"),
+                            "weeklyPriceChange": row.get("weekly_pct"),
+                            "monthlyPriceChange": row.get("monthly_pct"),
+                            "isCurrentlyTradable": row.get("tradable")}
+        except (ValueError, KeyError, OSError):
+            pass
+    item = lookup(symbol)
+    if not item:
+        die(f"no instrument found for symbol {symbol!r}")
+    return item
+
+
+def cmd_quote(args):
+    out = []
+    for symbol in args.symbols:
+        inst = resolve(symbol)
+        rates = api_get("/api/v1/market-data/instruments/rates",
+                        {"instrumentIds": inst["instrumentId"]}).get("rates", [])
+        rate = rates[0] if rates else {}
+        out.append({
+            "symbol": inst.get("internalSymbolFull"),
+            "name": inst.get("displayname"),
+            "instrument_id": inst["instrumentId"],
+            "bid": rate.get("bid"), "ask": rate.get("ask"),
+            "last": rate.get("lastExecution", inst.get("currentRate")),
+            "daily_pct": inst.get("dailyPriceChange"),
+            "weekly_pct": inst.get("weeklyPriceChange"),
+            "monthly_pct": inst.get("monthlyPriceChange"),
+            "tradable": inst.get("isCurrentlyTradable"),
+        })
+    emit(out)
+
+
+def fetch_candles(instrument_id, interval, count):
+    payload = api_get(
+        f"/api/v1/market-data/instruments/{instrument_id}/history/candles/desc/{interval}/{count}")
+    groups = (payload or {}).get("candles", [])
+    candles = groups[0].get("candles", []) if groups else []
+    return list(reversed(candles))  # chronological order
+
+
+def cmd_candles(args):
+    inst = resolve(args.symbol)
+    candles = fetch_candles(inst["instrumentId"], args.interval, args.count)
+    emit({"symbol": inst.get("internalSymbolFull"), "interval": args.interval,
+          "candles": [{"d": c.get("fromDate", "")[:10], "o": c.get("open"), "h": c.get("high"),
+                       "l": c.get("low"), "c": c.get("close"), "v": c.get("volume")}
+                      for c in candles]})
+
+
+def wilder(values, period):
+    """Wilder's smoothing — the correct averaging for RSI and ATR."""
+    if len(values) < period:
+        return None
+    avg = sum(values[:period]) / period
+    for val in values[period:]:
+        avg = (avg * (period - 1) + val) / period
+    return avg
+
+
+def cmd_indicators(args):
+    inst = resolve(args.symbol)
+    candles = fetch_candles(inst["instrumentId"], "OneDay", max(args.lookback, 60))
+    closes = [c["close"] for c in candles if c.get("close") is not None]
+    highs = [c["high"] for c in candles if c.get("high") is not None]
+    lows = [c["low"] for c in candles if c.get("low") is not None]
+    vols = [c.get("volume") or 0 for c in candles]
+    if len(closes) < 20:
+        die(f"only {len(closes)} candles for {args.symbol}; need at least 20")
+
+    deltas = [closes[i] - closes[i - 1] for i in range(1, len(closes))]
+    rs_gain = wilder([max(d, 0) for d in deltas], 14)
+    rs_loss = wilder([abs(min(d, 0)) for d in deltas], 14)
+    rsi = 100.0 if not rs_loss else 100 - 100 / (1 + rs_gain / rs_loss)
+
+    trs = [max(highs[i] - lows[i], abs(highs[i] - closes[i - 1]), abs(lows[i] - closes[i - 1]))
+           for i in range(1, len(closes))]
+    atr = wilder(trs, 14)
+
+    last = closes[-1]
+    sma20 = sum(closes[-20:]) / 20
+    sma50 = sum(closes[-50:]) / 50 if len(closes) >= 50 else None
+    # The final candle is the current, still-forming session, so its volume is partial.
+    # Compare the last COMPLETED session against the 20 before it.
+    avg_vol20 = sum(vols[-21:-1]) / 20 if len(vols) >= 21 else None
+    last_full_vol = vols[-2] if len(vols) >= 2 else None
+
+    def pct(a, b):
+        return round((a / b - 1) * 100, 2) if a and b else None
+
+    emit({
+        "symbol": inst.get("internalSymbolFull"),
+        "instrument_id": inst["instrumentId"],
+        "tradable": inst.get("isCurrentlyTradable"),
+        "last": round(last, 4),
+        "sma20": round(sma20, 4),
+        "sma50": round(sma50, 4) if sma50 else None,
+        "rsi14": round(rsi, 1),
+        "atr14": round(atr, 4) if atr else None,
+        "atr_pct": round(atr / last * 100, 2) if atr else None,
+        "high20": round(max(highs[-20:]), 4),
+        "low20": round(min(lows[-20:]), 4),
+        "dist_from_sma20_pct": pct(last, sma20),
+        "dist_from_sma50_pct": pct(last, sma50),
+        "dist_from_high20_pct": pct(last, max(highs[-20:])),
+        "above_sma20": last > sma20,
+        "above_sma50": bool(sma50 and last > sma50),
+        "vol_ratio_20d": round(last_full_vol / avg_vol20, 2) if avg_vol20 and last_full_vol else None,
+        "candles_used": len(closes),
+    })
+
+
+# ---------------------------------------------------------------------- portfolio
+
+def get_portfolio():
+    pnl = api_get("/api/v1/trading/info/demo/pnl") or {}
+    cp = pnl.get("clientPortfolio", {}) or {}
+    positions = cp.get("positions", []) or []
+    credit = cp.get("credit", 0.0) or 0.0
+    unrealized = cp.get("unrealizedPnL", 0.0) or 0.0
+
+    def field(pos, *names, default=None):
+        for name in names:
+            if name in pos and pos[name] is not None:
+                return pos[name]
+        return default
+
+    shaped = []
+    invested = 0.0
+    for pos in positions:
+        amount = field(pos, "amount", "investedAmount", "invested", default=0.0) or 0.0
+        invested += amount
+        shaped.append({
+            "position_id": field(pos, "positionID", "positionId"),
+            "instrument_id": field(pos, "instrumentID", "instrumentId"),
+            "is_buy": field(pos, "isBuy"),
+            "open_rate": field(pos, "openRate"),
+            "amount": amount,
+            "units": field(pos, "units"),
+            "leverage": field(pos, "leverage"),
+            "stop_loss": field(pos, "stopLossRate"),
+            "take_profit": field(pos, "takeProfitRate"),
+            "opened_at": field(pos, "openDateTime", "openTimestamp"),
+            "unrealized_pnl": field(pos, "profit", "unrealizedPnl", default=0.0),
+        })
+    return {
+        "ts": now_iso(),
+        "cash": round(credit, 2),
+        "invested": round(invested, 2),
+        "unrealized_pnl": round(unrealized, 2),
+        "equity": round(credit + invested + unrealized, 2),
+        "open_positions": len(shaped),
+        "positions": shaped,
+    }
+
+
+def cmd_cost(args):
+    """What-if cost breakdown for an order. A read-semantics POST — nothing is placed.
+    Worth calling before any entry: crypto CFD overnight fees are large enough to
+    swamp the expected move on a multi-day hold."""
+    inst = resolve(args.symbol)
+    body = {"action": "open", "transaction": "buy", "symbol": inst["internalSymbolFull"],
+            "settlementType": args.settlement, "orderType": "mkt",
+            "leverage": args.leverage, "amount": args.amount, "orderCurrency": "usd"}
+    payload = api_post_read("/api/v2/trading/info/demo/costs", body)
+    costs = {c["costType"]: c["value"] for c in (payload or {}).get("costs", [])}
+    entry = costs.get("transactionFee", 0) + costs.get("marketSpread", 0) + costs.get("markup", 0)
+    nightly = costs.get("overnightFee", 0)
+    emit({
+        "symbol": inst["internalSymbolFull"], "settlement": args.settlement,
+        "leverage": args.leverage, "amount": args.amount,
+        "entry_cost_usd": round(entry, 2),
+        "overnight_fee_usd": round(nightly, 2),
+        "cost_5day_hold_usd": round(entry + nightly * 5, 2),
+        "cost_5day_pct_of_margin": round((entry + nightly * 5) / args.amount * 100, 2),
+        "breakdown": costs,
+    })
+
+
+def api_post_read(path, body):
+    """POST a read-semantics route (cost/eligibility previews). Changes nothing."""
+    data = json.dumps(body).encode()
+    headers = {"x-user-key": user_key(), "x-api-key": APP_KEY,
+               "x-request-id": str(uuid.uuid4()), "Accept": "application/json",
+               "Content-Type": "application/json", "User-Agent": "etoro-trading-bot/1.0"}
+    req = urllib.request.Request(BASE + path, data=data, headers=headers, method="POST")
+    try:
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            return json.loads(resp.read().decode("utf-8") or "null")
+    except urllib.error.HTTPError as exc:
+        die(f"HTTP {exc.code} on {path}: {exc.read().decode('utf-8', 'replace')[:300]}", 2)
+    except (urllib.error.URLError, TimeoutError) as exc:
+        die(f"network error on {path}: {exc}", 2)
+
+
+def cmd_portfolio(args):
+    emit(get_portfolio())
+
+
+def cmd_history(args):
+    since = args.since or (datetime.now(timezone.utc) - timedelta(days=30)).strftime("%Y-%m-%d")
+    rows = api_get("/api/v1/trading/info/trade/demo/history",
+                   {"minDate": since, "pageSize": args.limit}) or []
+    emit({"since": since, "count": len(rows), "trades": rows})
+
+
+def cmd_snapshot(args):
+    port = get_portfolio()
+    write_json("portfolio.json", port)
+
+    # Join live positions with the thesis captured at entry — this is what gives a
+    # cold run its memory of why each position exists.
+    theses = latest_trades()
+    joined = []
+    for pos in port["positions"]:
+        trade = theses.get(pos["position_id"], {})
+        joined.append({**pos, **{k: trade.get(k) for k in
+                                 ("symbol", "setup", "signals", "thesis", "invalidation",
+                                  "conviction", "target", "stop", "risk_r", "opened_at",
+                                  "expected_hold_days", "rules_applied")}})
+    write_json("positions.json", {"ts": port["ts"], "positions": joined})
+    append_jsonl("equity.jsonl", {
+        "ts": port["ts"], "equity": port["equity"], "cash": port["cash"],
+        "unrealized_pnl": port["unrealized_pnl"], "open_positions": port["open_positions"],
+    })
+    emit({"ok": True, "equity": port["equity"], "open_positions": port["open_positions"]})
+
+
+def cmd_mark(args):
+    """Sample every open position's PnL. Feeds MAE/MFE, which is how we later tell
+    'the thesis was wrong' apart from 'the stop was too tight'."""
+    port = get_portfolio()
+    theses = latest_trades()
+    marked = 0
+    for pos in port["positions"]:
+        trade = theses.get(pos["position_id"], {})
+        risk = trade.get("risk_r") or 0
+        pnl = pos.get("unrealized_pnl") or 0
+        amount = pos.get("amount") or 0
+        append_jsonl("excursions.jsonl", {
+            "ts": port["ts"],
+            "position_id": pos["position_id"],
+            "symbol": trade.get("symbol"),
+            "rate": pos.get("open_rate"),
+            "pnl_usd": round(pnl, 2),
+            "pnl_pct": round(pnl / amount * 100, 2) if amount else None,
+            "pnl_r": round(pnl / risk, 3) if risk else None,
+        })
+        marked += 1
+    emit({"ok": True, "marked": marked})
+
+
+def cmd_benchmark(args):
+    """Record reference assets so improvement can be told apart from market drift."""
+    prices = {}
+    for symbol in BENCHMARK_SYMBOLS:
+        try:
+            inst = resolve(symbol)
+            prices[symbol] = inst.get("currentRate")
+        except SystemExit:
+            continue
+    append_jsonl("benchmark.jsonl", {"ts": now_iso(), "prices": prices})
+    emit({"ok": True, "prices": prices})
+
+
+# ----------------------------------------------------------------- journal / runs
+
+def cmd_log_event(args):
+    record = {"ts": now_iso(), "run_id": args.run_id, "cycle": args.cycle, "type": args.type,
+              "symbol": args.symbol, "reason": args.reason}
+    if args.detail:
+        try:
+            record["detail"] = json.loads(args.detail)
+        except ValueError:
+            die("--detail must be valid JSON")
+    append_jsonl("events.jsonl", record)
+    emit({"ok": True})
+
+
+def cmd_record_trade(args):
+    """Append a trade record (entry or exit). Merged on position_id by latest_trades()."""
+    try:
+        record = json.loads(args.json)
+    except ValueError:
+        die("argument must be valid JSON")
+    if "position_id" not in record:
+        die("trade record requires a position_id")
+    record.setdefault("ts", now_iso())
+    append_jsonl("trades.jsonl", record)
+    emit({"ok": True, "position_id": record["position_id"]})
+
+
+def cmd_journal(args):
+    events = read_jsonl("events.jsonl")[-args.last:]
+    emit(events)
+
+
+def cmd_run_start(args):
+    run_id = f"{args.cycle}-{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')}"
+    print(run_id)
+
+
+def cmd_run_end(args):
+    port = get_portfolio()
+    append_jsonl("runs.jsonl", {
+        "run_id": args.run_id, "cycle": args.cycle,
+        "started_at": args.started_at, "ended_at": now_iso(),
+        "duration_s": args.duration, "equity": port["equity"], "cash": port["cash"],
+        "open_positions": port["open_positions"],
+        "trades_opened": args.opened, "trades_closed": args.closed,
+        "no_trade_reason": args.no_trade_reason, "exit_code": args.exit_code,
+    })
+    emit({"ok": True})
+
+
+# ------------------------------------------------------------------------- stats
+
+def tier_for(n):
+    """Sample-size tiers. Mechanical on purpose: the weekly review cannot talk itself
+    into promoting a rule that the evidence does not support."""
+    if n >= 30:
+        return "established"
+    if n >= 10:
+        return "provisional"
+    return "hypothesis"
+
+
+def cohort_stats(trades):
+    rs = [t["outcome_r"] for t in trades if t.get("outcome_r") is not None]
+    if not rs:
+        return None
+    wins = [r for r in rs if r > 0]
+    losses = [r for r in rs if r <= 0]
+    gross_win = sum(wins)
+    gross_loss = abs(sum(losses))
+    return {
+        "n": len(rs),
+        "tier": tier_for(len(rs)),
+        "win_rate": round(len(wins) / len(rs), 3),
+        "avg_win_r": round(statistics.mean(wins), 3) if wins else 0.0,
+        "avg_loss_r": round(statistics.mean(losses), 3) if losses else 0.0,
+        "expectancy_r": round(statistics.mean(rs), 3),
+        "profit_factor": round(gross_win / gross_loss, 2) if gross_loss else None,
+        "total_r": round(sum(rs), 2),
+    }
+
+
+def cmd_stats(args):
+    closed = [t for t in latest_trades().values()
+              if t.get("status") == "closed" and t.get("outcome_r") is not None]
+    closed.sort(key=lambda t: t.get("closed_at") or "")
+
+    def group(trades, keyfn):
+        out = defaultdict(list)
+        for trade in trades:
+            val = keyfn(trade)
+            for item in (val if isinstance(val, list) else [val]):
+                if item is not None:
+                    out[str(item)].append(trade)
+        return out
+
+    by_setup = {k: cohort_stats(v) for k, v in group(closed, lambda t: t.get("setup")).items()}
+    by_signal = {k: cohort_stats(v) for k, v in group(closed, lambda t: t.get("signals") or []).items()}
+    by_class = {k: cohort_stats(v) for k, v in group(closed, lambda t: t.get("asset_class")).items()}
+    by_conv = {k: cohort_stats(v) for k, v in group(closed, lambda t: t.get("conviction")).items()}
+
+    # Rolling 20-trade expectancy: the headline improvement metric.
+    rolling = []
+    rs = [t["outcome_r"] for t in closed]
+    for i in range(19, len(rs)):
+        window = rs[i - 19:i + 1]
+        rolling.append({"trade_index": i + 1,
+                        "closed_at": closed[i].get("closed_at"),
+                        "expectancy_r": round(statistics.mean(window), 3)})
+
+    errors = defaultdict(int)
+    errors_by_month = defaultdict(lambda: defaultdict(int))
+    for trade in closed:
+        cat = trade.get("error_category") or "unlabelled"
+        errors[cat] += 1
+        month = (trade.get("closed_at") or "")[:7]
+        if month:
+            errors_by_month[month][cat] += 1
+
+    winners = [t for t in closed if t["outcome_r"] > 0]
+    losers = [t for t in closed if t["outcome_r"] <= 0]
+    mae_winners = [t["mae_r"] for t in winners if t.get("mae_r") is not None]
+    mfe_losers = [t["mfe_r"] for t in losers if t.get("mfe_r") is not None]
+
+    stats = {
+        "generated_at": now_iso(),
+        "overall": cohort_stats(closed) or {"n": 0, "tier": "hypothesis"},
+        "by_setup": by_setup,
+        "by_signal": by_signal,
+        "by_asset_class": by_class,
+        "by_conviction": by_conv,
+        "rolling20_expectancy_r": rolling,
+        "error_categories": dict(sorted(errors.items(), key=lambda kv: -kv[1])),
+        "error_categories_by_month": {k: dict(v) for k, v in sorted(errors_by_month.items())},
+        "stop_and_exit_quality": {
+            # If winners routinely dip well below zero before working, stops are too tight.
+            "avg_mae_r_of_winners": round(statistics.mean(mae_winners), 3) if mae_winners else None,
+            # If losers routinely showed good profit first, exits are too slow.
+            "avg_mfe_r_of_losers": round(statistics.mean(mfe_losers), 3) if mfe_losers else None,
+        },
+        "tier_thresholds": {"hypothesis": "n<10 — changes nothing",
+                            "provisional": "n>=10 — may adjust ranking/sizing, may not veto",
+                            "established": "n>=30 — may veto a setup"},
+    }
+    write_json("stats.json", stats)
+    if args.quiet:
+        emit({"ok": True, "closed_trades": stats["overall"].get("n", 0)})
+    else:
+        emit(stats)
+
+
+# --------------------------------------------------------------------------- main
+
+def main():
+    parser = argparse.ArgumentParser(prog="etoro", description=__doc__,
+                                     formatter_class=argparse.RawDescriptionHelpFormatter)
+    sub = parser.add_subparsers(dest="cmd", required=True)
+
+    p = sub.add_parser("types", help="list instrument types (for screen filters)")
+    p.set_defaults(func=cmd_types)
+
+    p = sub.add_parser("universe", help="show/refresh the cached tradable universe")
+    p.add_argument("--refresh", action="store_true", help="rebuild from the API now (~2 min)")
+    p.add_argument("--verbose", action="store_true", help="per-symbol progress to stderr")
+    p.set_defaults(func=cmd_universe)
+
+    p = sub.add_parser("screen", help="rank the cached universe (quality-gated)")
+    p.add_argument("--class", dest="asset_class", default="stock",
+                   choices=["stock", "crypto", "etf", "all"])
+    p.add_argument("--sort", default="monthly",
+                   help="daily|weekly|monthly|price (default: monthly)")
+    p.add_argument("--asc", action="store_true", help="ascending (default: descending)")
+    p.add_argument("--limit", type=int, default=25)
+    p.add_argument("--min-price", type=float)
+    p.add_argument("--all-instruments", dest="tradable_only", action="store_false",
+                   default=True, help="include instruments whose market is shut")
+    p.add_argument("--symbols", help="comma-separated allowlist to restrict to")
+    p.add_argument("--refresh", action="store_true", help="rebuild the universe cache first")
+    p.set_defaults(func=cmd_screen)
+
+    p = sub.add_parser("quote", help="live bid/ask for one or more symbols")
+    p.add_argument("symbols", nargs="+")
+    p.set_defaults(func=cmd_quote)
+
+    p = sub.add_parser("candles", help="OHLCV history")
+    p.add_argument("symbol")
+    p.add_argument("--interval", default="OneDay")
+    p.add_argument("--count", type=int, default=30)
+    p.set_defaults(func=cmd_candles)
+
+    p = sub.add_parser("indicators", help="SMA/RSI/ATR/range, computed locally")
+    p.add_argument("symbol")
+    p.add_argument("--lookback", type=int, default=60)
+    p.set_defaults(func=cmd_indicators)
+
+    p = sub.add_parser("cost", help="what-if cost of an order (places nothing)")
+    p.add_argument("symbol")
+    p.add_argument("--settlement", default="cfd", choices=["cfd", "real"])
+    p.add_argument("--leverage", type=int, default=2)
+    p.add_argument("--amount", type=float, default=2000.0)
+    p.set_defaults(func=cmd_cost)
+
+    p = sub.add_parser("portfolio", help="account snapshot")
+    p.set_defaults(func=cmd_portfolio)
+
+    p = sub.add_parser("history", help="closed trades from eToro")
+    p.add_argument("--since", help="YYYY-MM-DD (default: 30 days ago)")
+    p.add_argument("--limit", type=int, default=100)
+    p.set_defaults(func=cmd_history)
+
+    p = sub.add_parser("snapshot", help="refresh data/portfolio.json, positions.json, equity.jsonl")
+    p.set_defaults(func=cmd_snapshot)
+
+    p = sub.add_parser("mark", help="append a mark-to-market sample per open position")
+    p.set_defaults(func=cmd_mark)
+
+    p = sub.add_parser("benchmark", help="record reference asset prices")
+    p.set_defaults(func=cmd_benchmark)
+
+    p = sub.add_parser("log-event", help="append to events.jsonl")
+    p.add_argument("--run-id", required=True)
+    p.add_argument("--cycle", required=True)
+    p.add_argument("--type", required=True)
+    p.add_argument("--symbol")
+    p.add_argument("--reason", default="")
+    p.add_argument("--detail", help="JSON object")
+    p.set_defaults(func=cmd_log_event)
+
+    p = sub.add_parser("record-trade", help="append a trade record (entry or exit) as JSON")
+    p.add_argument("json")
+    p.set_defaults(func=cmd_record_trade)
+
+    p = sub.add_parser("journal", help="recent events")
+    p.add_argument("--last", type=int, default=20)
+    p.set_defaults(func=cmd_journal)
+
+    p = sub.add_parser("run-start", help="print a new run id")
+    p.add_argument("cycle")
+    p.set_defaults(func=cmd_run_start)
+
+    p = sub.add_parser("run-end", help="append a run record")
+    p.add_argument("--run-id", required=True)
+    p.add_argument("--cycle", required=True)
+    p.add_argument("--started-at", required=True)
+    p.add_argument("--duration", type=float, default=0)
+    p.add_argument("--opened", type=int, default=0)
+    p.add_argument("--closed", type=int, default=0)
+    p.add_argument("--no-trade-reason")
+    p.add_argument("--exit-code", type=int, default=0)
+    p.set_defaults(func=cmd_run_end)
+
+    p = sub.add_parser("stats", help="recompute data/stats.json from the trade log")
+    p.add_argument("--quiet", action="store_true", help="print only a summary")
+    p.set_defaults(func=cmd_stats)
+
+    args = parser.parse_args()
+    args.func(args)
+
+
+if __name__ == "__main__":
+    main()
