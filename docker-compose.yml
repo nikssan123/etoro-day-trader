@@ -81,8 +81,13 @@ services:
     #  1. compose does not interpolate env_file values, so a hash containing `$` cannot
     #     be silently mangled the way it would be via `environment:`.
     #  2. it keeps ETORO_USER_KEY (in .env) out of the internet-facing container.
+    # required:false so compose still works before this file exists — otherwise the
+    # command that GENERATES it cannot run (bin/dashboard-secrets.sh). The server
+    # refuses to start without the values, so a missing file fails loudly at boot
+    # rather than silently coming up unauthenticated.
     env_file:
-      - .env.dashboard
+      - path: .env.dashboard
+        required: false
 
     volumes:
       - ./data:/data:ro

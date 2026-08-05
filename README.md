@@ -99,10 +99,8 @@ the reverse proxy already running on the host routes the domain to it. Setup —
 the proxy and DNS steps — is in [`dashboard/README.md`](dashboard/README.md).
 
 ```bash
-cp .env.dashboard.example .env.dashboard
-docker compose run --rm --no-deps --entrypoint node dashboard \
-  server/dist/hash-password.js 'your dashboard password'   # paste into .env.dashboard
-openssl rand -hex 32                                        # JWT_SECRET
+docker network create web        # once per host, if it does not exist
+bin/dashboard-secrets.sh         # prompts for a password, writes .env.dashboard
 docker compose up -d
 ```
 

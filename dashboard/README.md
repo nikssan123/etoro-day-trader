@@ -28,24 +28,40 @@ Everything else is defence in depth:
 
 ### 1. Secrets
 
+One command, run from the repo root:
+
 ```bash
-cp .env.dashboard.example .env.dashboard
-
-# Password hash (12+ characters). Prints saltHex:hashHex — paste that, not the password.
-docker compose run --rm --no-deps --entrypoint node dashboard \
-  server/dist/hash-password.js 'your dashboard password'
-
-# Cookie signing secret
-openssl rand -hex 32
+bin/dashboard-secrets.sh
 ```
 
-Put both in `.env.dashboard`.
+It builds the image if needed, prompts twice for a password (hidden), and writes
+`.env.dashboard` with mode 600 containing the scrypt hash and a fresh 32-byte
+`JWT_SECRET`. Re-run it to rotate — changing `JWT_SECRET` logs out every session.
 
-> **Why a separate file from `.env`?** Two reasons, both learned the hard way here.
-> Docker compose interpolates `$` in env values — a bcrypt hash (`$2b$12$…`) gets
-> silently mangled into one that can never match, with no error anywhere. The hash format
-> used now contains no `$` at all, so that class of bug is gone. The split also keeps
-> `ETORO_USER_KEY` out of the internet-facing container entirely.
+**The password is piped in on stdin, never passed as an argument.** An argument would be
+saved to your shell history and visible in `ps` to every user on the box while it runs.
+For the same reason, don't paste the password into a command yourself.
+
+Doing it by hand instead:
+
+```bash
+cp .env.dashboard.example .env.dashboard
+printf '%s' 'your password' | docker run --rm -i etoro-trading-dashboard:latest \
+  node server/dist/hash-password.js     # -> DASHBOARD_PASSWORD_HASH
+openssl rand -hex 32                    # -> JWT_SECRET
+```
+
+> **Why a separate file from `.env`?** Two reasons, both found the hard way here.
+> Docker compose interpolates `$` in env values, including from `env_file` on current
+> versions — a bcrypt hash (`$2b$12$…`) came through mangled as `$$2a$$12/cQgnyqG…`,
+> which would have produced a login that silently never succeeded. The scrypt format used
+> now contains no `$` at all, and the server validates the hash shape at boot so a damaged
+> value fails loudly instead of mysteriously. The split also keeps `ETORO_USER_KEY` out of
+> the internet-facing container entirely.
+>
+> The compose `env_file` entry is marked `required: false` so that the file's *absence*
+> doesn't block the very command that creates it. The server still refuses to start
+> without the values, so nothing can come up unauthenticated.
 
 ### 2. Domain
 
