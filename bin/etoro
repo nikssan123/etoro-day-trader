@@ -150,8 +150,18 @@ def read_jsonl(name):
 
 
 def write_json(name, obj):
+    """Write atomically: temp file + rename.
+
+    The dashboard polls these files from another container. A plain write truncates in
+    place, so a reader that lands mid-write gets invalid JSON, silently falls back to an
+    empty object, and renders a blank panel. os.replace is atomic on POSIX, so a reader
+    always sees either the whole old file or the whole new one.
+    """
     DATA.mkdir(exist_ok=True)
-    (DATA / name).write_text(json.dumps(obj, indent=2, default=str) + "\n")
+    path = DATA / name
+    tmp = path.with_name(path.name + ".tmp")
+    tmp.write_text(json.dumps(obj, indent=2, default=str) + "\n")
+    os.replace(tmp, path)
 
 
 def clean_items(payload):
@@ -531,10 +541,16 @@ def cmd_snapshot(args):
                                   "conviction", "target", "stop", "risk_r", "opened_at",
                                   "expected_hold_days", "rules_applied")}})
     write_json("positions.json", {"ts": port["ts"], "positions": joined})
-    append_jsonl("equity.jsonl", {
-        "ts": port["ts"], "equity": port["equity"], "cash": port["cash"],
-        "unrealized_pnl": port["unrealized_pnl"], "open_positions": port["open_positions"],
-    })
+
+    # The equity series is the performance chart's x-axis, so it is sampled once per
+    # cycle, not once per refresh. The frequent dashboard refresh passes --no-equity:
+    # appending there would add ~700 points a day, swamp the chart and grow the file
+    # without bound, while telling you nothing a per-cycle sample does not.
+    if not getattr(args, "no_equity", False):
+        append_jsonl("equity.jsonl", {
+            "ts": port["ts"], "equity": port["equity"], "cash": port["cash"],
+            "unrealized_pnl": port["unrealized_pnl"], "open_positions": port["open_positions"],
+        })
     emit({"ok": True, "equity": port["equity"], "open_positions": port["open_positions"]})
 
 
@@ -786,6 +802,8 @@ def main():
     p.set_defaults(func=cmd_history)
 
     p = sub.add_parser("snapshot", help="refresh data/portfolio.json, positions.json, equity.jsonl")
+    p.add_argument("--no-equity", action="store_true",
+                   help="skip the equity.jsonl append (for the frequent dashboard refresh)")
     p.set_defaults(func=cmd_snapshot)
 
     p = sub.add_parser("mark", help="append a mark-to-market sample per open position")

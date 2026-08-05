@@ -76,6 +76,18 @@ export function App() {
     return () => window.removeEventListener('focus', onFocus);
   }, [authed, load]);
 
+  // Poll while the tab is visible. The bot refreshes portfolio.json every 2 minutes, so
+  // without this an open tab would sit on whatever it fetched at page load. Paused when
+  // hidden: a backgrounded tab hitting the API forever is waste, and the focus handler
+  // above already covers the return.
+  useEffect(() => {
+    if (!authed) return undefined;
+    const id = setInterval(() => {
+      if (document.visibilityState === 'visible') void load();
+    }, 60_000);
+    return () => clearInterval(id);
+  }, [authed, load]);
+
   if (authed === false) return <Login onSuccess={() => { setAuthed(null); void load(); }} />;
   if (authed === null || !data) {
     return <div className="app"><p className="subtle">{error ?? 'Loading…'}</p></div>;

@@ -13,3 +13,11 @@
 47 22  * * 1-5   /app/bin/trade-cycle.sh close
 15 12  * * 6     /app/bin/trade-cycle.sh weekly
 15 12  1 * *     /app/bin/trade-cycle.sh monthly
+
+# Dashboard freshness. One API call (/trading/info/demo/pnl) rewrites portfolio.json and
+# positions.json with live unrealized P&L, so the dashboard stops showing the account as
+# it stood at the last cycle boundary. Runs 24/7 because crypto does.
+#
+# Budget: reads share 120/60s with the bot's own research. This is 0.5 calls/min = 0.4%.
+# --no-equity keeps the performance chart sampled per cycle rather than per refresh.
+*/2  *  * * *    /app/bin/etoro snapshot --no-equity >/dev/null 2>&1
