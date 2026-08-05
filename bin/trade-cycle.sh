@@ -21,8 +21,10 @@ fi
 PROMPT_FILE="$REPO/prompts/$CYCLE.md"
 [[ -f "$PROMPT_FILE" ]] || { echo "missing prompt: $PROMPT_FILE" >&2; exit 66; }
 
-# Homebrew and asdf/nvm paths — launchd starts with a minimal PATH.
-export PATH="/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:$PATH"
+# Both launchd (macOS) and supercronic (container) start with a minimal PATH.
+# /opt/homebrew is where the macOS claude lives; /usr/local/bin is where npm -g puts it
+# in the container.
+export PATH="/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin:$PATH"
 command -v claude >/dev/null || { echo "claude CLI not found on PATH" >&2; exit 69; }
 
 mkdir -p logs data

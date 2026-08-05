@@ -1,0 +1,49 @@
+services:
+  bot:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile
+    image: etoro-trading-bot:latest
+    container_name: trading-bot
+    restart: unless-stopped
+
+    environment:
+      # The schedule assumes the US session is 16:30-23:00 local. Change this and the
+      # cycle times in docker/crontab stop lining up with the market.
+      TZ: ${TZ:-Europe/Sofia}
+      ETORO_USER_KEY: ${ETORO_USER_KEY:?set ETORO_USER_KEY in .env}
+      # Optional: skip interactive login by billing per token instead.
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+
+    volumes:
+      # The repo itself: code in, data/ and strategy/ out. Living on the host means the
+      # trade history and learned rules survive image rebuilds, and a future dashboard
+      # can read them directly.
+      - .:/app
+      # Claude's auth token and settings. A named volume so `claude login` is done once
+      # and survives restarts.
+      - claude-home:/home/node
+
+    # Hard cap. Claude Code is usually a few hundred MB but can spike past 1GB on a long
+    # run; without a limit an unlucky spike could make the kernel OOM-kill a neighbouring
+    # container instead of this one.
+    mem_limit: 2g
+    memswap_limit: 2g
+    cpus: 1.5
+
+    # Defence in depth: the bot is an autonomous agent with shell access processing
+    # untrusted input (market data, web results). It gets no extra kernel capabilities
+    # and cannot escalate privileges.
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "5"
+
+volumes:
+  claude-home:

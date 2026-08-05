@@ -53,6 +53,42 @@ bin/install-schedule.sh uninstall
 Credentials come from the `x-user-key` on the `etoro-public-api` MCP entry in `~/.claude.json`,
 or from `ETORO_USER_KEY`. **No key is stored in this repo.**
 
+## Deploying to a server (recommended)
+
+launchd only fires while the Mac is awake, so a laptop that sleeps through the US session
+simply misses those cycles. For unattended running, deploy the container to an always-on host.
+
+The bot is an autonomous agent with shell access, running unattended on input it does not
+control (market data, web search results). On a host that runs anything else, **isolate it** —
+the container exists for blast radius, not for packaging convenience. It gets `cap_drop: ALL`,
+`no-new-privileges`, a 2 GB memory cap so a spike cannot get a neighbouring container
+OOM-killed, and only this repo mounted.
+
+```bash
+git clone <this repo> /opt/trading-bot && cd /opt/trading-bot
+cp .env.example .env && $EDITOR .env      # paste ETORO_USER_KEY, set TZ
+
+# The container runs as uid 1000 and must be able to write data/ and strategy/.
+sudo chown -R 1000:1000 /opt/trading-bot
+
+docker compose build
+docker compose run --rm bot claude login  # once; token persists in the claude-home volume
+docker compose run --rm bot bin/etoro universe --refresh   # ~2 min
+docker compose run --rm bot bin/etoro portfolio            # confirm credentials
+
+docker compose run --rm bot bin/trade-cycle.sh overnight   # one supervised cycle
+docker compose up -d                                       # start the schedule
+docker compose logs -f
+```
+
+`ETORO_USER_KEY` lives only in the host's `.env` (gitignored) and the running container's
+memory — the entrypoint writes the MCP config at startup, so no key is ever in the image or the
+repo. Set `ANTHROPIC_API_KEY` in `.env` instead of `claude login` if you prefer per-token
+billing to an interactive login.
+
+Verified on the image: correct timezone, valid crontab, and egress to `public-api.etoro.com`,
+`mcp.public-api.etoro.com` and `api.anthropic.com` under the hardened settings.
+
 ## Schedule (Europe/Sofia; US session is 16:30–23:00 local)
 
 | Cycle | When | Model | Purpose |
@@ -65,8 +101,10 @@ or from `ETORO_USER_KEY`. **No key is stored in this repo.**
 | `weekly` | Sat 12:15 | Opus | Turn statistics into rules |
 | `monthly` | 1st of month 12:15 | Opus | Improvement report vs benchmark |
 
-launchd rather than cron: cron silently skips jobs missed while the Mac sleeps; launchd runs
-them on wake.
+On a server the same schedule is driven by `docker/crontab` via supercronic; on a Mac it is
+driven by launchd (`bin/install-schedule.sh`). launchd rather than cron on macOS because cron
+silently skips jobs missed while the machine sleeps, whereas launchd runs them on wake — but
+neither helps if the machine is off, which is why the container is the recommended deployment.
 
 ## How the learning loop works
 

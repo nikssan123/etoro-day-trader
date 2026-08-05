@@ -1,0 +1,7 @@
+# Build context only — the repo itself is bind-mounted at runtime, so none of this
+# needs baking into the image. Keeps the context small and secrets out of it.
+.git
+.env
+logs/
+data/
+launchd/

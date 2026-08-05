@@ -1,0 +1,15 @@
+# Trading cycles. Times are container-local — set TZ in .env (default Europe/Sofia),
+# where the US session runs 16:30-23:00.
+#
+# Minutes are deliberately off :00 and :30 to avoid the moment every scheduler on the
+# planet fires at once.
+#
+# Read by supercronic (see Dockerfile). Standard 5-field cron: min hour dom mon dow
+
+12  9  * * 1-5   /app/bin/trade-cycle.sh overnight
+ 7 13  * * 1-5   /app/bin/trade-cycle.sh premarket
+47 16  * * 1-5   /app/bin/trade-cycle.sh open
+33 19  * * 1-5   /app/bin/trade-cycle.sh midday
+47 22  * * 1-5   /app/bin/trade-cycle.sh close
+15 12  * * 6     /app/bin/trade-cycle.sh weekly
+15 12  1 * *     /app/bin/trade-cycle.sh monthly

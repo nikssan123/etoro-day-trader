@@ -4,6 +4,7 @@ logs/
 __pycache__/
 *.pyc
 .env
+!.env.example
 
 .cycle.pid
 .cycle.lock
